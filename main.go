@@ -19,6 +19,7 @@ import (
 
 	"github.com/Shopify/sarama"
 	"gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2/bson"
 )
 
 type Message struct {
@@ -48,6 +49,15 @@ type Message struct {
 	ParentCreatedAt int64                  `json:"parent_created_at"`
 }
 
+var hosts = os.Getenv("MONGO_DATABASE_HOST")
+var database = os.Getenv("MONGO_INITDB_DATABASE")
+var username = os.Getenv("MONGO_INITDB_ROOT_USERNAME")
+var password = os.Getenv("MONGO_INITDB_ROOT_PASSWORD")
+var collection = "inventory_events"
+var poollimit, _ = strconv.Atoi(os.Getenv("MONGO_MAX_POOL_SIZE"))
+var clientID = os.Getenv("KARAFKA_CLIENT_ID")
+var topics = os.Getenv("KARAFKA_TOPICS")
+
 type Event struct {
 	Event_Type int32
 	Payload    map[string]interface{}
@@ -58,15 +68,26 @@ type Event struct {
 	Created_At time.Time
 }
 
-var hosts = os.Getenv("MONGO_DATABASE_HOST")
-var database = os.Getenv("MONGO_INITDB_DATABASE")
-var username = os.Getenv("MONGO_INITDB_ROOT_USERNAME")
-var password = os.Getenv("MONGO_INITDB_ROOT_PASSWORD")
-var collection = "inventory_events"
-var poollimit, _ = strconv.Atoi(os.Getenv("MONGO_MAX_POOL_SIZE"))
-var clientID = os.Getenv("KARAFKA_CLIENT_ID")
-var topics = os.Getenv("KARAFKA_TOPICS")
+type MessageInventoryProduct struct {
+	Payload Payload `json:"payload"`
+}
 
+type InventoryProduct struct {
+	Sold               int32  `json:"sold"`
+	Carry              int32  `json:"carry"`
+	Ordered            int32  `json:"ordered"`
+	ProductID          string `json:"product_id"`
+	StoreCode          string `json:"store_code"`
+	ProductName        string `json:"product_name"`
+	CurrentInventory   int32  `json:"current_inventory"`
+	RetailBusinessType string `json:"retail_business_type"`
+}
+
+type Payload struct {
+	StoreCode         string             `json:"store_code"`
+	StoreName         string             `json:"store_name"`
+	InventoryProducts []InventoryProduct `json:"inventory_products"`
+}
 type MongoStore struct {
 	session *mgo.Session
 }
@@ -86,7 +107,7 @@ func initMongo() (session *mgo.Session) {
 
 	session, err := mgo.DialWithInfo(info)
 	if err != nil {
-		fmt.Println(err)
+		panic(err)
 	}
 
 	return
@@ -134,8 +155,6 @@ func createTLSConfiguration() (t *tls.Config) {
 }
 
 func main() {
-	session := initMongo()
-	mongoStore.session = session
 
 	flag.Parse()
 
@@ -258,7 +277,7 @@ func saveEventToMongo(message []byte) {
 	switch _message.StreamType {
 	case "PRODUCT_MAPPING":
 		eventType = 2
-	case "CURRENT_INVENTORY_PRODUCT", "INVENTORY_PRODUCT":
+	case "CURRENT_INVENTORY_PRODUCT":
 		eventType = 1
 	default:
 		eventType = 1
@@ -271,13 +290,50 @@ func saveEventToMongo(message []byte) {
 	_event.Created_At = time.Now()
 	_event.Updated_At = time.Now()
 
-	col := mongoStore.session.DB(database).C(collection)
-	//Insert job into MongoDB
-	errMongo := col.Insert(_event)
-	if errMongo != nil {
-		fmt.Println(errMongo)
+	session := initMongo()
+	col := session.DB(database)
+
+	if _message.StreamType == "PRODUCT_MAPPING" {
+		//Insert job into MongoDB
+		errMongo := col.C("inventory_events").Insert(_event)
+
+		if errMongo != nil {
+			panic(errMongo)
+		} else {
+			fmt.Println("Saved to MongoDB")
+		}
+
 	} else {
-		fmt.Println("Saved to MongoDB")
+		updateInventoryProduct(message, col)
 	}
 
+	defer session.Close()
+}
+
+func updateInventoryProduct(event []byte, session *mgo.Database) {
+	client := session.C("inventory_products")
+
+	inventoryUpdateMessage := MessageInventoryProduct{}
+
+	err := json.Unmarshal(event, &inventoryUpdateMessage)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	for _, inventoryProduct := range inventoryUpdateMessage.Payload.InventoryProducts {
+		_, error := client.Upsert(bson.M{"product_code": inventoryProduct.ProductID, "store_id": inventoryUpdateMessage.Payload.StoreCode}, bson.M{"$set": bson.M{
+			"store_id":         inventoryUpdateMessage.Payload.StoreCode,
+			"store_name":       inventoryUpdateMessage.Payload.StoreName,
+			"carry":            inventoryProduct.Carry,
+			"current_quantity": inventoryProduct.CurrentInventory,
+			"product_name":     inventoryProduct.ProductName,
+			"product_code":     inventoryProduct.ProductID,
+		}})
+
+		if error != nil {
+			fmt.Println(error)
+		} else {
+			fmt.Println("Inventory Product updated.")
+		}
+	}
 }
